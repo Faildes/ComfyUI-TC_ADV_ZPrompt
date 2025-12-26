@@ -433,6 +433,12 @@ def _load_gpu_if_possible(clip):
         model_management.load_model_gpu(clip.patcher)
         return
 
+def _unwrap_hf_tokenizer_from_zimage_tokenizer(z_tok):
+    hf = getattr(getattr(z_tok, "tokenizer", None), "tokenizer", None)
+    if hf is None or not callable(hf):
+        raise RuntimeError("TC_ADV_ZPrompt: cannot find callable HF tokenizer at clip.tokenizer.tokenizer.tokenizer")
+    return hf
+
 def _encode_single_zimage(
     clip,
     text: str,
@@ -441,84 +447,66 @@ def _encode_single_zimage(
     weight_strength: float,
     clamp_min: float,
     clamp_max: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    returns:
-      hidden: (1,L,H) valid-only
-      pooled: (1,H)
-    """
-    tokenizer, model = _get_tokenizer_and_model(clip)
-    device = model_management.get_torch_device()
+):
+    tokenized = clip.tokenize(text, return_word_ids=True)
+    tok_l = tokenized.get("l", None)
+    if tok_l is None:
+        raise RuntimeError("TC_ADV_ZPrompt: clip.tokenize() did not return key 'l' for Z-Image")
 
-    # weighted token ids for content only
-    content_ids, content_w, clean_text = _token_weights_from_segments(tokenizer, text)
+    # flatten token ids
+    ids_flat = [t for chunk in tok_l for (t, w, wid) in chunk]
 
-    user_text = clean_text
-    if hasattr(tokenizer, "apply_chat_template"):
-        messages = [{"role": "user", "content": user_text}]
-        templated = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=enable_thinking,
-        )
-    else:
-        templated = user_text
+    z_tok = getattr(clip, "tokenizer", None)
+    if z_tok is None:
+        raise RuntimeError("TC_ADV_ZPrompt: clip.tokenizer not found")
 
-    text_inputs = tokenizer(
-        templated,
-        padding="max_length",
-        max_length=int(max_sequence_length),
-        truncation=True,
-        return_tensors="pt",
-    )
+    hf_tok = _unwrap_hf_tokenizer_from_zimage_tokenizer(z_tok)
 
-    input_ids = text_inputs["input_ids"].to(device)
-    attn_mask = text_inputs["attention_mask"].to(device).bool()
+    content_ids, content_w, _ = _token_weights_from_segments(hf_tok, text)
 
-    with torch.no_grad():
-        out = model(
-            input_ids=input_ids,
-            attention_mask=attn_mask,
-            output_hidden_states=True,
-        )
+    weights_flat = [1.0] * len(ids_flat)
+    s_idx = _find_sublist(ids_flat, content_ids, 0) if content_ids else -1
 
-    hidden_states = getattr(out, "hidden_states", None)
-    if hidden_states is None and isinstance(out, (tuple, list)) and len(out) >= 2:
-        hidden_states = out[1]
-    if hidden_states is None:
-        raise RuntimeError("TC_ADV_ZPrompt: model output has no hidden_states. Ensure output_hidden_states=True is supported.")
+    if s_idx != -1 and content_w:
+        n = min(len(content_w), len(ids_flat) - s_idx)
 
-    h_all = hidden_states[-2][0]  # (T,H) batch=1
-    vm = attn_mask[0]
-    hidden = h_all[vm]            # (L,H)
-    full_ids = input_ids[0][vm].tolist()
+        for i in range(n):
+            w = float(content_w[i])
 
-    s_idx = _find_sublist(full_ids, content_ids, 0) if content_ids else -1
-    if s_idx == -1 or not content_w:
-        pooled = hidden[-1].clone()
-        return hidden.unsqueeze(0), pooled
+            # NegPiP
+            if w < 0.0:
+                w = 1.0 + w
 
-    e_idx = min(s_idx + len(content_ids), hidden.size(0))
+            # strength
+            w = 1.0 + (w - 1.0) * float(weight_strength)
 
-    w_full = [1.0] * len(full_ids)
-    n = min(len(content_w), len(w_full) - s_idx, e_idx - s_idx)
-    for i in range(n):
-        w_full[s_idx + i] = float(content_w[i])
+            # clamp
+            if w < float(clamp_min):
+                w = float(clamp_min)
+            if w > float(clamp_max):
+                w = float(clamp_max)
 
-    w_tensor = torch.tensor(w_full, dtype=hidden.dtype, device=hidden.device)
+            weights_flat[s_idx + i] = w
 
-    hidden2 = _apply_weights_content_only(
-        hidden,
-        w_tensor,
-        (s_idx, e_idx),
-        strength=float(weight_strength),
-        clamp_min=float(clamp_min),
-        clamp_max=float(clamp_max),
-    )
+    idx = 0
+    tok_l_w = []
+    for chunk in tok_l:
+        new_chunk = []
+        for (t, _w, wid) in chunk:
+            if idx < len(weights_flat):
+                new_chunk.append((t, float(weights_flat[idx]), wid))
+            else:
+                new_chunk.append((t, 1.0, wid))
+            idx += 1
+        tok_l_w.append(new_chunk)
 
-    pooled = hidden2[-1].clone()
-    return hidden2.unsqueeze(0), pooled
+    emb = clip.encode_from_tokens({"l": tok_l_w})
+    if isinstance(emb, (tuple, list)):
+        emb = emb[0]
+
+    pooled = emb[:, -1, :].clone()
+    return emb, pooled
+
 
 def _encode_with_AND_safe(
     clip,
