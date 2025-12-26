@@ -442,8 +442,6 @@ def _unwrap_hf_tokenizer_from_zimage_tokenizer(z_tok):
 def _encode_single_zimage(
     clip,
     text: str,
-    max_sequence_length: int,
-    enable_thinking: bool,
     weight_strength: float,
     clamp_min: float,
     clamp_max: float,
@@ -511,8 +509,6 @@ def _encode_single_zimage(
 def _encode_with_AND_safe(
     clip,
     text: str,
-    max_sequence_length: int,
-    enable_thinking: bool,
     weight_strength: float,
     clamp_min: float,
     clamp_max: float,
@@ -521,8 +517,6 @@ def _encode_with_AND_safe(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     base_h, base_p = _encode_single_zimage(
         clip, text,
-        max_sequence_length=max_sequence_length,
-        enable_thinking=enable_thinking,
         weight_strength=weight_strength,
         clamp_min=clamp_min,
         clamp_max=clamp_max,
@@ -553,8 +547,6 @@ def _encode_with_AND_safe(
     for t, w in parsed:
         hi, pi = _encode_single_zimage(
             clip, t,
-            max_sequence_length=max_sequence_length,
-            enable_thinking=enable_thinking,
             weight_strength=weight_strength,
             clamp_min=clamp_min,
             clamp_max=clamp_max,
@@ -588,8 +580,6 @@ def advanced_zprompt_encode(
     text: str,
     schedule_steps: int = 30,
     use_schedule: bool = True,
-    max_sequence_length: int = 1024,
-    enable_thinking: bool = False,
     weight_strength: float = 2.0,
     clamp_min: float = 0.0,
     clamp_max: float = 3.0,
@@ -608,8 +598,6 @@ def advanced_zprompt_encode(
     if not use_schedule:
         h, p = _encode_with_AND_safe(
             clip, text,
-            max_sequence_length=max_sequence_length,
-            enable_thinking=enable_thinking,
             weight_strength=weight_strength,
             clamp_min=clamp_min,
             clamp_max=clamp_max,
@@ -623,8 +611,6 @@ def advanced_zprompt_encode(
     if len(sched) <= 1:
         h, p = _encode_with_AND_safe(
             clip, text,
-            max_sequence_length=max_sequence_length,
-            enable_thinking=enable_thinking,
             weight_strength=weight_strength,
             clamp_min=clamp_min,
             clamp_max=clamp_max,
@@ -642,8 +628,6 @@ def advanced_zprompt_encode(
 
         h, p = _encode_with_AND_safe(
             clip, subtext,
-            max_sequence_length=max_sequence_length,
-            enable_thinking=enable_thinking,
             weight_strength=weight_strength,
             clamp_min=clamp_min,
             clamp_max=clamp_max,

@@ -12,10 +12,6 @@ class TC_ADV_ZPrompt:
                 "use_schedule": ("BOOLEAN", {"default": True}),
                 "schedule_steps": ("INT", {"default": 30, "min": 1, "max": 10000}),
 
-                # Z-Image tokenizer/model options
-                "max_sequence_length": ("INT", {"default": 1024, "min": 16, "max": 32768}),
-                "enable_thinking": ("BOOLEAN", {"default": False}),
-
                 # weighting options
                 "weight_strength": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 50.0, "step": 0.01}),
                 "clamp_min": ("FLOAT", {"default": 0.0, "min": -10.0, "max": 10.0, "step": 0.01}),
@@ -37,8 +33,6 @@ class TC_ADV_ZPrompt:
         text,
         use_schedule,
         schedule_steps,
-        max_sequence_length,
-        enable_thinking,
         weight_strength,
         clamp_min,
         clamp_max,
@@ -50,8 +44,6 @@ class TC_ADV_ZPrompt:
             text=text,
             use_schedule=use_schedule,
             schedule_steps=schedule_steps,
-            max_sequence_length=max_sequence_length,
-            enable_thinking=enable_thinking,
             weight_strength=weight_strength,
             clamp_min=clamp_min,
             clamp_max=clamp_max,
