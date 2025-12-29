@@ -439,6 +439,44 @@ def _unwrap_hf_tokenizer_from_zimage_tokenizer(z_tok):
         raise RuntimeError("TC_ADV_ZPrompt: cannot find callable HF tokenizer at clip.tokenizer.tokenizer.tokenizer")
     return hf
 
+def _zkey_qwen3_4b(clip) -> str:
+    z_tok = getattr(clip, "tokenizer", None)
+    k = getattr(z_tok, "clip_name", None)
+    return k or "qwen3_4b"
+
+def _to_flat_ids(x):
+    ids = x
+    if isinstance(ids, torch.Tensor):
+        ids = ids.tolist()
+    if isinstance(ids, list) and len(ids) == 1 and isinstance(ids[0], list):
+        ids = ids[0]
+    return ids
+
+def _content_slice_from_llama_template(z_tok, hf_tok, ids_flat):
+    tmpl = getattr(z_tok, "llama_template", None)
+    if not tmpl or "{}" not in tmpl:
+        return (0, len(ids_flat))
+
+    prefix, suffix = tmpl.split("{}", 1)
+    p_ids = _to_flat_ids(hf_tok(prefix, add_special_tokens=False, truncation=False).input_ids)
+    s_ids = _to_flat_ids(hf_tok(suffix, add_special_tokens=False, truncation=False).input_ids)
+
+    if len(p_ids) <= len(ids_flat) and ids_flat[:len(p_ids)] == p_ids:
+        c0 = len(p_ids)
+    else:
+        c0 = 0
+
+    if len(s_ids) <= len(ids_flat) and ids_flat[-len(s_ids):] == s_ids:
+        c1 = len(ids_flat) - len(s_ids)
+    else:
+        c1 = len(ids_flat)
+
+    if c0 < 0: c0 = 0
+    if c1 > len(ids_flat): c1 = len(ids_flat)
+    if c0 >= c1:
+        return (0, len(ids_flat))
+    return (c0, c1)
+
 def _encode_single_zimage(
     clip,
     text: str,
@@ -446,63 +484,75 @@ def _encode_single_zimage(
     clamp_min: float,
     clamp_max: float,
 ):
-    tokenized = clip.tokenize(text, return_word_ids=True)
-    tok_l = tokenized.get("l", None)
-    if tok_l is None:
-        raise RuntimeError("TC_ADV_ZPrompt: clip.tokenize() did not return key 'l' for Z-Image")
-
-    # flatten token ids
-    ids_flat = [t for chunk in tok_l for (t, w, wid) in chunk]
-
     z_tok = getattr(clip, "tokenizer", None)
     if z_tok is None:
         raise RuntimeError("TC_ADV_ZPrompt: clip.tokenizer not found")
 
     hf_tok = _unwrap_hf_tokenizer_from_zimage_tokenizer(z_tok)
 
-    content_ids, content_w, _ = _token_weights_from_segments(hf_tok, text)
+    content_ids, content_w, clean_text = _token_weights_from_segments(hf_tok, text)
+    tokenized = clip.tokenize(clean_text, return_word_ids=True)
 
+    k = _zkey_qwen3_4b(clip)
+    tok = tokenized.get(k, None)
+    if tok is None:
+        raise RuntimeError(f"TC_ADV_ZPrompt: clip.tokenize() did not return key '{k}' for Z-Image (keys={list(tokenized.keys())})")
+
+    # flatten token ids
+    ids_flat = [t for chunk in tok for (t, _w, _wid) in chunk]
     weights_flat = [1.0] * len(ids_flat)
-    s_idx = _find_sublist(ids_flat, content_ids, 0) if content_ids else -1
 
-    if s_idx != -1 and content_w:
-        n = min(len(content_w), len(ids_flat) - s_idx)
+    c0, c1 = _content_slice_from_llama_template(z_tok, hf_tok, ids_flat)
 
-        for i in range(n):
-            w = float(content_w[i])
+    if content_ids and content_w:
+        s_idx = -1
 
-            # NegPiP
-            if w < 0.0:
-                w = 1.0 + w
+        if (c1 - c0) == len(content_ids) and ids_flat[c0:c1] == content_ids:
+            s_idx = c0
+        else:
+            # fallback
+            s_idx = _find_sublist(ids_flat, content_ids, start=c0)
+            if s_idx != -1 and (s_idx + len(content_ids) > c1):
+                s_idx = -1
 
-            # strength
-            w = 1.0 + (w - 1.0) * float(weight_strength)
+        if s_idx != -1:
+            n = min(len(content_w), len(ids_flat) - s_idx)
+            for i in range(n):
+                w = float(content_w[i])
 
-            # clamp
-            if w < float(clamp_min):
-                w = float(clamp_min)
-            if w > float(clamp_max):
-                w = float(clamp_max)
+                # NegPiP: w<0 -> 1+w
+                if w < 0.0:
+                    w = 1.0 + w
 
-            weights_flat[s_idx + i] = w
+                # strength
+                w = 1.0 + (w - 1.0) * float(weight_strength)
 
+                # clamp
+                w = max(float(clamp_min), min(float(clamp_max), w))
+                weights_flat[s_idx + i] = w
+
+    # rebuild weighted token chunks
     idx = 0
-    tok_l_w = []
-    for chunk in tok_l:
+    tok_w = []
+    for chunk in tok:
         new_chunk = []
         for (t, _w, wid) in chunk:
-            if idx < len(weights_flat):
-                new_chunk.append((t, float(weights_flat[idx]), wid))
-            else:
-                new_chunk.append((t, 1.0, wid))
+            w = float(weights_flat[idx]) if idx < len(weights_flat) else 1.0
+            new_chunk.append((t, w, wid))
             idx += 1
-        tok_l_w.append(new_chunk)
+        tok_w.append(new_chunk)
 
-    emb = clip.encode_from_tokens({"l": tok_l_w})
-    if isinstance(emb, (tuple, list)):
-        emb = emb[0]
+    out = clip.encode_from_tokens({k: tok_w})
 
-    pooled = emb[:, -1, :].clone()
+    if isinstance(out, (tuple, list)) and len(out) == 2 and isinstance(out[0], torch.Tensor):
+        emb, pooled = out
+        if isinstance(pooled, torch.Tensor):
+            if pooled.dim() == 3 and pooled.size(1) == 1:
+                pooled = pooled[:, 0, :]
+    else:
+        emb = out[0] if isinstance(out, (tuple, list)) else out
+        pooled = emb[:, -1, :].clone()
+
     return emb, pooled
 
 
