@@ -418,6 +418,8 @@ def _iter_token_items(chunk):
 
 
 def _unwrap_hf_tokenizer_from_zimage_tokenizer(z_tok):
+    if hasattr(z_tok, "decode"):
+        return z_tok
     inner = getattr(z_tok, "tokenizer", None)          # Qwen3Tokenizer
     if inner is not None:
         hf = getattr(inner, "tokenizer", None)         # Qwen2Tokenizer
