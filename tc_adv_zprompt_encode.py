@@ -1,5 +1,6 @@
-import re
+import re, os
 from typing import List, Tuple, Optional, Union
+import logging
 
 import torch
 from comfy import model_management
@@ -7,6 +8,8 @@ from comfy import model_management
 # ---------------------------
 # prompt attention parser
 # ---------------------------
+
+logger = logging.getLogger(__name__)
 
 re_attention = re.compile(r"""
 \\\(|\\\)|\\\[|\\]|\\\\|\\|
@@ -163,10 +166,6 @@ except Exception:
 # Z-Image helpers
 # ---------------------------
 
-def _negpip_factor(w: torch.Tensor) -> torch.Tensor:
-    # w>=0 => w, w<0 => 1+w
-    return torch.where(w >= 0, w, 1.0 + w)
-
 def _find_sublist(haystack: List[int], needle: List[int], start: int = 0) -> int:
     if not needle:
         return -1
@@ -257,33 +256,6 @@ def _token_weights_from_segments(tokenizer, prompt: str) -> Tuple[List[int], Lis
         weights.append(wsum / osum if osum > 0 else 1.0)
 
     return ids, weights, clean_text
-
-def _apply_weights_content_only(
-    hidden: torch.Tensor,               # (L,H) valid-only
-    weight_tensor: torch.Tensor,        # (L,)
-    content_slice: Tuple[int, int],
-    strength: float,
-    clamp_min: float,
-    clamp_max: float,
-) -> torch.Tensor:
-    c0, c1 = content_slice
-    if not (0 <= c0 < c1 <= hidden.size(0)):
-        return hidden
-
-    out = hidden
-    seg = out[c0:c1]  # (S,H)
-
-    w = weight_tensor[c0:c1]
-    f = _negpip_factor(w)
-    f = 1.0 + (f - 1.0) * float(strength)
-    f = f.clamp(min=float(clamp_min), max=float(clamp_max))
-
-    anchor = seg.mean(dim=0, keepdim=True)  # (1,H)
-    seg2 = anchor + (seg - anchor) * f.unsqueeze(-1)
-
-    out = out.clone()
-    out[c0:c1] = seg2
-    return out
 
 def _resample_seq_to_len(x: torch.Tensor, L: int) -> torch.Tensor:
     if x.size(0) == L:
@@ -411,71 +383,69 @@ def _split_suffix_weight(seg: str) -> Tuple[str, float]:
 # main: Z-Image encode (ComfyUI)
 # ---------------------------
 
-def _get_tokenizer_and_model(clip):
-    if hasattr(clip, "tokenizer"):
-        tok = clip.tokenizer
-    elif hasattr(clip, "cond_stage_model") and hasattr(clip.cond_stage_model, "tokenizer"):
-        tok = clip.cond_stage_model.tokenizer
-    else:
-        raise RuntimeError("TC_ADV_ZPrompt: clip/tokenizer not found. Provide a Z-Image CLIP wrapper with .tokenizer")
-
-    if hasattr(clip, "cond_stage_model"):
-        model = clip.cond_stage_model
-    elif hasattr(clip, "model"):
-        model = clip.model
-    else:
-        raise RuntimeError("TC_ADV_ZPrompt: cond_stage_model not found. Provide a Z-Image CLIP wrapper with .cond_stage_model")
-
-    return tok, model
 
 def _load_gpu_if_possible(clip):
     if hasattr(clip, "patcher"):
         model_management.load_model_gpu(clip.patcher)
         return
 
+
+def _pick_token_key(tokenized: dict) -> str:
+    if not isinstance(tokenized, dict) or len(tokenized) == 0:
+        raise RuntimeError("TC_ADV_ZPrompt: clip.tokenize() returned invalid tokens")
+
+    for k in ("qwen3_4b", "l", "g"):
+        if k in tokenized:
+            return k
+        
+    if len(tokenized) == 1:
+        return next(iter(tokenized.keys()))
+
+    raise RuntimeError(f"TC_ADV_ZPrompt: unknown token keys: {list(tokenized.keys())}")
+
+
+def _iter_token_items(chunk):
+    for it in chunk:
+        if isinstance(it, (tuple, list)):
+            if len(it) == 3:
+                yield int(it[0]), float(it[1]), it[2]
+            elif len(it) == 2:
+                yield int(it[0]), float(it[1]), None
+            else:
+                yield int(it[0]), 1.0, None
+        else:
+            yield int(it), 1.0, None
+
+
 def _unwrap_hf_tokenizer_from_zimage_tokenizer(z_tok):
-    hf = getattr(getattr(z_tok, "tokenizer", None), "tokenizer", None)
-    if hf is None or not callable(hf):
-        raise RuntimeError("TC_ADV_ZPrompt: cannot find callable HF tokenizer at clip.tokenizer.tokenizer.tokenizer")
-    return hf
+    inner = getattr(z_tok, "tokenizer", None)          # Qwen3Tokenizer
+    if inner is not None:
+        hf = getattr(inner, "tokenizer", None)         # Qwen2Tokenizer
+        if callable(hf) and hasattr(hf, "decode"):
+            return hf
 
-def _zkey_qwen3_4b(clip) -> str:
-    z_tok = getattr(clip, "tokenizer", None)
-    k = getattr(z_tok, "clip_name", None)
-    return k or "qwen3_4b"
+        if callable(inner) and hasattr(inner, "decode"):
+            return inner
 
-def _to_flat_ids(x):
-    ids = x
-    if isinstance(ids, torch.Tensor):
-        ids = ids.tolist()
-    if isinstance(ids, list) and len(ids) == 1 and isinstance(ids[0], list):
-        ids = ids[0]
-    return ids
+        tok_path = getattr(inner, "tokenizer_path", None)
+        if isinstance(tok_path, str):
+            try:
+                from transformers import Qwen2Tokenizer
+                hf2 = Qwen2Tokenizer.from_pretrained(tok_path)
+                if callable(hf2) and hasattr(hf2, "decode"):
+                    return hf2
+            except Exception:
+                pass
 
-def _content_slice_from_llama_template(z_tok, hf_tok, ids_flat):
-    tmpl = getattr(z_tok, "llama_template", None)
-    if not tmpl or "{}" not in tmpl:
-        return (0, len(ids_flat))
+    for name in ("hf_tokenizer", "_hf_tokenizer", "_tokenizer", "tokenizer_hf"):
+        hf = getattr(z_tok, name, None)
+        if callable(hf) and hasattr(hf, "decode"):
+            return hf
 
-    prefix, suffix = tmpl.split("{}", 1)
-    p_ids = _to_flat_ids(hf_tok(prefix, add_special_tokens=False, truncation=False).input_ids)
-    s_ids = _to_flat_ids(hf_tok(suffix, add_special_tokens=False, truncation=False).input_ids)
-
-    if len(p_ids) <= len(ids_flat) and ids_flat[:len(p_ids)] == p_ids:
-        c0 = len(p_ids)
-    else:
-        c0 = 0
-
-    if len(s_ids) <= len(ids_flat) and ids_flat[-len(s_ids):] == s_ids:
-        c1 = len(ids_flat) - len(s_ids)
-    else:
-        c1 = len(ids_flat)
-
-    if c0 < 0: c0 = 0
-    if c1 > len(ids_flat): c1 = len(ids_flat)
-    if c0 >= c1:
-        return (0, len(ids_flat))
-    return (c0, c1)
+    raise RuntimeError(
+        "TC_ADV_ZPrompt: cannot find callable HF tokenizer. "
+        "Expected clip.tokenizer.tokenizer.tokenizer (ZImageTokenizer->Qwen3Tokenizer->Qwen2Tokenizer)."
+    )
 
 def _encode_single_zimage(
     clip,
@@ -484,76 +454,75 @@ def _encode_single_zimage(
     clamp_min: float,
     clamp_max: float,
 ):
+    # 1) tokenize with ComfyUI CLIP API
+    clean_text, _segs = _strip_attention_syntax(text or "")
+    tokenized = clip.tokenize(clean_text, return_word_ids=True)
+
+    key = _pick_token_key(tokenized)
+    tok_chunks = tokenized[key]
+    if tok_chunks is None:
+        raise RuntimeError(f"TC_ADV_ZPrompt: tokens missing key '{key}' (keys={list(tokenized.keys())})")
+
+    # 2) flatten token ids
+    ids_flat = []
+    for ch in tok_chunks:
+        for tid, _w, _wid in _iter_token_items(ch):
+            ids_flat.append(tid)
+
+    # 3) get HF tokenizer（ZImageTokenizer -> Qwen3Tokenizer -> Qwen2Tokenizer）
     z_tok = getattr(clip, "tokenizer", None)
     if z_tok is None:
         raise RuntimeError("TC_ADV_ZPrompt: clip.tokenizer not found")
-
     hf_tok = _unwrap_hf_tokenizer_from_zimage_tokenizer(z_tok)
 
-    content_ids, content_w, clean_text = _token_weights_from_segments(hf_tok, text)
-    tokenized = clip.tokenize(clean_text, return_word_ids=True)
+    # 4) calculate content token ids and weights
+    content_ids, content_w, _ = _token_weights_from_segments(hf_tok, text)
 
-    k = _zkey_qwen3_4b(clip)
-    tok = tokenized.get(k, None)
-    if tok is None:
-        raise RuntimeError(f"TC_ADV_ZPrompt: clip.tokenize() did not return key '{k}' for Z-Image (keys={list(tokenized.keys())})")
-
-    # flatten token ids
-    ids_flat = [t for chunk in tok for (t, _w, _wid) in chunk]
+    # 5) find content token sublist in ids_flat, and build weights_flat
     weights_flat = [1.0] * len(ids_flat)
 
-    c0, c1 = _content_slice_from_llama_template(z_tok, hf_tok, ids_flat)
-
-    if content_ids and content_w:
-        s_idx = -1
-
-        if (c1 - c0) == len(content_ids) and ids_flat[c0:c1] == content_ids:
-            s_idx = c0
-        else:
-            # fallback
-            s_idx = _find_sublist(ids_flat, content_ids, start=c0)
-            if s_idx != -1 and (s_idx + len(content_ids) > c1):
-                s_idx = -1
-
-        if s_idx != -1:
-            n = min(len(content_w), len(ids_flat) - s_idx)
-            for i in range(n):
-                w = float(content_w[i])
-
-                # NegPiP: w<0 -> 1+w
-                if w < 0.0:
-                    w = 1.0 + w
-
-                # strength
-                w = 1.0 + (w - 1.0) * float(weight_strength)
-
-                # clamp
-                w = max(float(clamp_min), min(float(clamp_max), w))
-                weights_flat[s_idx + i] = w
-
-    # rebuild weighted token chunks
-    idx = 0
-    tok_w = []
-    for chunk in tok:
-        new_chunk = []
-        for (t, _w, wid) in chunk:
-            w = float(weights_flat[idx]) if idx < len(weights_flat) else 1.0
-            new_chunk.append((t, w, wid))
-            idx += 1
-        tok_w.append(new_chunk)
-
-    out = clip.encode_from_tokens({k: tok_w})
-
-    if isinstance(out, (tuple, list)) and len(out) == 2 and isinstance(out[0], torch.Tensor):
-        emb, pooled = out
-        if isinstance(pooled, torch.Tensor):
-            if pooled.dim() == 3 and pooled.size(1) == 1:
-                pooled = pooled[:, 0, :]
+    s_idx = _find_sublist(ids_flat, content_ids, 0) if content_ids else -1
+    if s_idx == -1 and content_ids:
+        logger.warning(
+            "TC_ADV_ZPrompt: content token sublist not found; fallback to no weighting. "
+            f"(key={key}, ids_flat={len(ids_flat)}, content_ids={len(content_ids)})"
+        )
     else:
-        emb = out[0] if isinstance(out, (tuple, list)) else out
-        pooled = emb[:, -1, :].clone()
+        n = min(len(content_w), len(ids_flat) - s_idx)
+        for i in range(n):
+            w = float(content_w[i])
 
-    return emb, pooled
+            # NegPiP
+            if w < 0.0:
+                w = 1.0 + w
+
+            # strength
+            w = 1.0 + (w - 1.0) * float(weight_strength)
+
+            # clamp
+            w = max(float(clamp_min), min(float(clamp_max), w))
+            weights_flat[s_idx + i] = w
+
+    # 6) rebuild token chunks
+    idx = 0
+    new_chunks = []
+    for ch in tok_chunks:
+        new_ch = []
+        for tid, _oldw, wid in _iter_token_items(ch):
+            if idx < len(weights_flat):
+                new_ch.append((tid, float(weights_flat[idx]), wid))
+            else:
+                new_ch.append((tid, 1.0, wid))
+            idx += 1
+        new_chunks.append(new_ch)
+
+    weighted_tokens = dict(tokenized)
+    weighted_tokens[key] = new_chunks
+
+    # 7) encode
+    cond, pooled = clip.encode_from_tokens(weighted_tokens, return_pooled=True)
+    return cond, pooled
+
 
 
 def _encode_with_AND_safe(
