@@ -166,6 +166,29 @@ except Exception:
 # Z-Image helpers
 # ---------------------------
 
+def _encode_ids(tokenizer, text: str) -> List[int]:
+    if callable(tokenizer):
+        enc = tokenizer(text, add_special_tokens=False, truncation=False)
+        ids = getattr(enc, "input_ids", None)
+        if ids is None and isinstance(enc, dict):
+            ids = enc.get("input_ids", None)
+        if ids is None:
+            raise RuntimeError("Tokenizer callable but no input_ids")
+    elif hasattr(tokenizer, "encode"):
+        try:
+            enc = tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            enc = tokenizer.encode(text)
+        ids = getattr(enc, "ids", enc)
+    else:
+        raise RuntimeError(f"Tokenizer is not callable and has no encode(): {type(tokenizer)}")
+
+    if isinstance(ids, torch.Tensor):
+        ids = ids.tolist()
+    if isinstance(ids, list) and len(ids) == 1 and isinstance(ids[0], list):
+        ids = ids[0]
+    return list(map(int, ids))
+
 def _find_sublist(haystack: List[int], needle: List[int], start: int = 0) -> int:
     if not needle:
         return -1
@@ -198,8 +221,20 @@ def _token_weights_from_segments(tokenizer, prompt: str) -> Tuple[List[int], Lis
     if not clean_text:
         return [], [], clean_text
 
-    enc = tokenizer(clean_text, add_special_tokens=False, truncation=False)
-    ids = enc.input_ids
+    ids = _encode_ids(tokenizer, clean_text)
+    pieces = [_decode_piece(tokenizer, tid) for tid in ids]
+    recon = "".join(pieces)
+
+    if recon != clean_text:
+        token_ids: List[int] = []
+        weights: List[float] = []
+        for t, w in segs:
+            if not t:
+                continue
+            tid = _encode_ids(tokenizer, t)
+            token_ids.extend(tid)
+            weights.extend([float(w)] * len(tid))
+        return token_ids, weights, clean_text
     if isinstance(ids, torch.Tensor):
         ids = ids.tolist()
     if isinstance(ids, list) and len(ids) == 1 and isinstance(ids[0], list):
@@ -383,6 +418,24 @@ def _split_suffix_weight(seg: str) -> Tuple[str, float]:
 # main: Z-Image encode (ComfyUI)
 # ---------------------------
 
+class _TokenizerAdapter:
+    def __init__(self, tok):
+        self.tok = tok
+
+    def __call__(self, text, add_special_tokens=False, truncation=False):
+        ids = _encode_ids(self.tok, text)
+        return type("Enc", (), {"input_ids": ids})
+
+    def decode(self, ids, clean_up_tokenization_spaces=False, skip_special_tokens=False):
+        try:
+            return self.tok.decode(ids, clean_up_tokenization_spaces=clean_up_tokenization_spaces,
+                                   skip_special_tokens=skip_special_tokens)
+        except TypeError:
+            try:
+                return self.tok.decode(ids, skip_special_tokens=skip_special_tokens)
+            except TypeError:
+                return self.tok.decode(ids)
+
 
 def _load_gpu_if_possible(clip):
     if hasattr(clip, "patcher"):
@@ -417,37 +470,79 @@ def _iter_token_items(chunk):
             yield int(it), 1.0, None
 
 
+def _is_usable_tokenizer(tok) -> bool:
+    if tok is None:
+        return False
+    if not hasattr(tok, "decode"):
+        return False
+    if callable(tok):
+        return True
+    if hasattr(tok, "encode"):
+        return True
+    return False
+
+def _maybe_wrap(tok):
+    if tok is None:
+        return None
+    if _is_usable_tokenizer(tok) and callable(tok):
+        return tok
+    if _is_usable_tokenizer(tok) and (not callable(tok)):
+        return _TokenizerAdapter(tok)
+    return None
+
 def _unwrap_hf_tokenizer_from_zimage_tokenizer(z_tok):
-    if hasattr(z_tok, "decode"):
-        return z_tok
-    inner = getattr(z_tok, "tokenizer", None)          # Qwen3Tokenizer
-    if inner is not None:
-        hf = getattr(inner, "tokenizer", None)         # Qwen2Tokenizer
-        if callable(hf) and hasattr(hf, "decode"):
-            return hf
+    seen = set()
 
-        if callable(inner) and hasattr(inner, "decode"):
-            return inner
+    def push(cands, x):
+        if x is None:
+            return
+        xid = id(x)
+        if xid in seen:
+            return
+        seen.add(xid)
+        cands.append(x)
 
-        tok_path = getattr(inner, "tokenizer_path", None)
+    q = []
+    push(q, z_tok)
+
+    for name in ("hf_tokenizer", "_hf_tokenizer", "_tokenizer", "tokenizer_hf", "inner_tokenizer", "base_tokenizer"):
+        push(q, getattr(z_tok, name, None))
+
+    i = 0
+    while i < len(q) and i < 32:
+        cur = q[i]; i += 1
+
+        wrapped = _maybe_wrap(cur)
+        if wrapped is not None:
+            return wrapped
+
+        push(q, getattr(cur, "tokenizer", None))
+        push(q, getattr(cur, "backend_tokenizer", None))
+        push(q, getattr(cur, "hf_tokenizer", None))
+
+        inner = getattr(cur, "tokenizer", None)
+        if inner is not None:
+            push(q, getattr(inner, "tokenizer", None))
+            inner2 = getattr(inner, "tokenizer", None)
+            if inner2 is not None:
+                push(q, getattr(inner2, "tokenizer", None))
+
+        tok_path = getattr(cur, "tokenizer_path", None)
         if isinstance(tok_path, str):
             try:
-                from transformers import Qwen2Tokenizer
-                hf2 = Qwen2Tokenizer.from_pretrained(tok_path)
-                if callable(hf2) and hasattr(hf2, "decode"):
-                    return hf2
+                from transformers import AutoTokenizer
+                hf = AutoTokenizer.from_pretrained(tok_path, use_fast=True)
+                wrapped = _maybe_wrap(hf)
+                if wrapped is not None:
+                    return wrapped
             except Exception:
                 pass
 
-    for name in ("hf_tokenizer", "_hf_tokenizer", "_tokenizer", "tokenizer_hf"):
-        hf = getattr(z_tok, name, None)
-        if callable(hf) and hasattr(hf, "decode"):
-            return hf
-
     raise RuntimeError(
-        "TC_ADV_ZPrompt: cannot find callable HF tokenizer. "
-        "Expected clip.tokenizer.tokenizer.tokenizer (ZImageTokenizer->Qwen3Tokenizer->Qwen2Tokenizer)."
+        "TC_ADV_ZPrompt: cannot find usable tokenizer (needs decode + (callable or encode)). "
+        "Your object chain exists but was not callable; add adapter as above."
     )
+
 
 def _encode_single_zimage(
     clip,
@@ -456,6 +551,11 @@ def _encode_single_zimage(
     clamp_min: float,
     clamp_max: float,
 ):
+    logger.warning(f"z_tok type={type(clip.tokenizer)}")
+    logger.warning(f"z_tok.tokenizer type={type(getattr(clip.tokenizer,'tokenizer',None))}")
+    logger.warning(f"z_tok.tokenizer.tokenizer type={type(getattr(getattr(clip.tokenizer,'tokenizer',None),'tokenizer',None))}")
+    logger.warning(f"z_tok.tokenizer.tokenizer.tokenizer type={type(getattr(getattr(getattr(clip.tokenizer,'tokenizer',None),'tokenizer',None),'tokenizer',None))}")
+    
     # 1) tokenize with ComfyUI CLIP API
     clean_text, _segs = _strip_attention_syntax(text or "")
     tokenized = clip.tokenize(clean_text, return_word_ids=True)
@@ -524,7 +624,6 @@ def _encode_single_zimage(
     # 7) encode
     cond, pooled = clip.encode_from_tokens(weighted_tokens, return_pooled=True)
     return cond, pooled
-
 
 
 def _encode_with_AND_safe(
